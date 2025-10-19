@@ -14,16 +14,28 @@ This server implements the following utility tools:
 - **hash_text**: Hash text using multiple algorithms (MD5, SHA1, SHA256, SHA512)
 - **bcrypt_hash**: Hash and verify passwords using bcrypt
 - **generate_rsa_keypair**: Generate RSA private/public key pairs
+- **aes_encrypt**: Encrypt text using AES-256-GCM with auto-generated or custom keys
+- **aes_decrypt**: Decrypt AES-256-GCM encrypted data
+- **hmac_sign**: Generate HMAC signatures for message authentication
+- **hmac_verify**: Verify HMAC signatures with constant-time comparison
 
 ### 🔧 Encoding & Utilities
 - **base64_encode**: Encode text to base64
 - **base64_decode**: Decode base64 text
 - **generate_token**: Generate random tokens with customizable character sets
 - **generate_uuid**: Generate UUIDs (v4 supported)
+- **url_parse**: Parse and analyze URL components
+- **url_encode**: URL encode text for safe transmission
+- **url_decode**: URL decode percent-encoded text
 
-### 🔍 Analysis Tools
+### 🔍 Analysis & Processing Tools
 - **analyze_password**: Comprehensive password strength analysis
-- **parse_jwt**: Parse and decode JWT tokens
+- **parse_jwt**: Parse and decode JWT tokens (basic parsing)
+- **jwt_create**: Create and sign JWT tokens with expiration and custom claims
+- **jwt_verify**: Verify JWT token signatures and decode payload
+- **regex_find**: Find all regex matches in text with position information
+- **regex_replace**: Replace text using regex patterns (single or global)
+- **text_utils**: Text processing utilities (word count, case conversion, trim, slugify, etc.)
 
 ## Installation & Running
 
@@ -72,6 +84,78 @@ The server will start on `http://127.0.0.1:8000` with the MCP endpoint at `/mcp`
     "name": "generate_rsa_keypair",
     "arguments": {
       "key_size": 2048
+    }
+  }
+}
+```
+
+### AES Encryption
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "aes_encrypt",
+    "arguments": {
+      "text": "Secret message to encrypt"
+    }
+  }
+}
+```
+
+### Create JWT Token
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "jwt_create",
+    "arguments": {
+      "payload": {"user_id": 123, "role": "admin"},
+      "secret": "your-secret-key",
+      "algorithm": "HS256",
+      "expires_in": 3600
+    }
+  }
+}
+```
+
+### HMAC Signature
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "hmac_sign",
+    "arguments": {
+      "message": "Important message",
+      "key": "secret-key",
+      "algorithm": "sha256"
+    }
+  }
+}
+```
+
+### Regex Find
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "regex_find",
+    "arguments": {
+      "text": "Contact us at support@example.com or admin@test.org",
+      "pattern": "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}"
+    }
+  }
+}
+```
+
+### Text Utilities
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "text_utils",
+    "arguments": {
+      "text": "Hello World! This is a Test String.",
+      "operation": "slugify"
     }
   }
 }

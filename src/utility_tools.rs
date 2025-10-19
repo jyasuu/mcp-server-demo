@@ -18,6 +18,13 @@ use md5;
 use bcrypt::{hash, verify, DEFAULT_COST};
 use rsa::{RsaPrivateKey, RsaPublicKey, pkcs8::EncodePrivateKey, pkcs8::EncodePublicKey};
 use rand::rngs::OsRng;
+use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead, KeyInit}};
+use hex;
+use url::Url;
+use regex::Regex;
+use jsonwebtoken::{encode, decode, Header, Algorithm, Validation, EncodingKey, DecodingKey};
+use hmac::{Hmac, Mac};
+use subtle::ConstantTimeEq;
 
 #[derive(Clone)]
 pub struct UtilityToolsServer {
@@ -129,6 +136,107 @@ pub struct RsaKeyGenRequest {
 
 fn default_key_size() -> usize {
     2048
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct AesEncryptRequest {
+    /// Text to encrypt
+    pub text: String,
+    /// AES-256 key (64 hex characters) - if not provided, one will be generated
+    pub key: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct AesDecryptRequest {
+    /// Encrypted data (hex encoded)
+    pub encrypted_data: String,
+    /// AES-256 key (64 hex characters)
+    pub key: String,
+    /// Nonce/IV (24 hex characters)
+    pub nonce: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct HmacRequest {
+    /// Message to authenticate
+    pub message: String,
+    /// Secret key for HMAC
+    pub key: String,
+    /// HMAC algorithm (sha256, sha512)
+    #[serde(default = "default_hmac_algo")]
+    pub algorithm: String,
+}
+
+fn default_hmac_algo() -> String {
+    "sha256".to_string()
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct HmacVerifyRequest {
+    /// Message to verify
+    pub message: String,
+    /// Secret key for HMAC
+    pub key: String,
+    /// HMAC signature to verify (hex encoded)
+    pub signature: String,
+    /// HMAC algorithm (sha256, sha512)
+    #[serde(default = "default_hmac_algo")]
+    pub algorithm: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct JwtCreateRequest {
+    /// JWT payload (JSON object)
+    pub payload: serde_json::Value,
+    /// Secret key for signing
+    pub secret: String,
+    /// Algorithm (HS256, HS512)
+    #[serde(default = "default_jwt_algo")]
+    pub algorithm: String,
+    /// Expiration time in seconds from now
+    pub expires_in: Option<u64>,
+}
+
+fn default_jwt_algo() -> String {
+    "HS256".to_string()
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct JwtVerifyRequest {
+    /// JWT token to verify
+    pub token: String,
+    /// Secret key for verification
+    pub secret: String,
+    /// Algorithm (HS256, HS512)
+    #[serde(default = "default_jwt_algo")]
+    pub algorithm: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct UrlRequest {
+    /// URL to parse or encode/decode
+    pub url: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct RegexRequest {
+    /// Text to search in
+    pub text: String,
+    /// Regular expression pattern
+    pub pattern: String,
+    /// Replace with (for replacement operations)
+    pub replacement: Option<String>,
+    /// Global replacement (replace all matches)
+    #[serde(default)]
+    pub global: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TextUtilsRequest {
+    /// Text to process
+    pub text: String,
+    /// Operation (word_count, char_count, line_count, reverse, slugify)
+    pub operation: String,
 }
 
 #[tool_router]
@@ -403,6 +511,421 @@ impl UtilityToolsServer {
             serde_json::to_string_pretty(&result).unwrap()
         ))]))
     }
+
+    #[tool(description = "Encrypt text using AES-256-GCM")]
+    fn aes_encrypt(&self, Parameters(req): Parameters<AesEncryptRequest>) -> Result<CallToolResult, McpError> {
+        use rand::RngCore;
+        
+        // Generate or parse key
+        let key_bytes = if let Some(key_hex) = req.key {
+            hex::decode(&key_hex).map_err(|e| McpError::invalid_params(format!("Invalid key hex: {}", e), None))?
+        } else {
+            let mut key_bytes = vec![0u8; 32]; // 256 bits
+            rand::thread_rng().fill_bytes(&mut key_bytes);
+            key_bytes
+        };
+
+        if key_bytes.len() != 32 {
+            return Err(McpError::invalid_params("Key must be 32 bytes (64 hex characters)", None));
+        }
+
+        // Generate random nonce
+        let mut nonce_bytes = vec![0u8; 12]; // 96 bits for GCM
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+
+        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        match cipher.encrypt(nonce, req.text.as_bytes()) {
+            Ok(ciphertext) => {
+                let result = json!({
+                    "encrypted_data": hex::encode(&ciphertext),
+                    "key": hex::encode(&key_bytes),
+                    "nonce": hex::encode(&nonce_bytes),
+                    "algorithm": "AES-256-GCM"
+                });
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "AES Encryption Result:\n{}",
+                    serde_json::to_string_pretty(&result).unwrap()
+                ))]))
+            }
+            Err(e) => Err(McpError::invalid_params(format!("Encryption failed: {}", e), None)),
+        }
+    }
+
+    #[tool(description = "Decrypt text using AES-256-GCM")]
+    fn aes_decrypt(&self, Parameters(req): Parameters<AesDecryptRequest>) -> Result<CallToolResult, McpError> {
+        let key_bytes = hex::decode(&req.key).map_err(|e| McpError::invalid_params(format!("Invalid key hex: {}", e), None))?;
+        let nonce_bytes = hex::decode(&req.nonce).map_err(|e| McpError::invalid_params(format!("Invalid nonce hex: {}", e), None))?;
+        let encrypted_data = hex::decode(&req.encrypted_data).map_err(|e| McpError::invalid_params(format!("Invalid encrypted data hex: {}", e), None))?;
+
+        if key_bytes.len() != 32 {
+            return Err(McpError::invalid_params("Key must be 32 bytes (64 hex characters)", None));
+        }
+        if nonce_bytes.len() != 12 {
+            return Err(McpError::invalid_params("Nonce must be 12 bytes (24 hex characters)", None));
+        }
+
+        let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
+        let cipher = Aes256Gcm::new(key);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        match cipher.decrypt(nonce, encrypted_data.as_slice()) {
+            Ok(plaintext) => {
+                match String::from_utf8(plaintext) {
+                    Ok(decrypted_text) => Ok(CallToolResult::success(vec![Content::text(format!(
+                        "AES Decryption Result: {}",
+                        decrypted_text
+                    ))])),
+                    Err(_) => Err(McpError::invalid_params("Decrypted data is not valid UTF-8", None)),
+                }
+            }
+            Err(e) => Err(McpError::invalid_params(format!("Decryption failed: {}", e), None)),
+        }
+    }
+
+    #[tool(description = "Generate HMAC signature for message authentication")]
+    fn hmac_sign(&self, Parameters(req): Parameters<HmacRequest>) -> Result<CallToolResult, McpError> {
+        type HmacSha256 = Hmac<Sha256>;
+        type HmacSha512 = Hmac<Sha512>;
+
+        let signature = match req.algorithm.to_lowercase().as_str() {
+            "sha256" => {
+                let mut mac = <HmacSha256 as KeyInit>::new_from_slice(req.key.as_bytes())
+                    .map_err(|e| McpError::invalid_params(format!("HMAC key error: {}", e), None))?;
+                mac.update(req.message.as_bytes());
+                hex::encode(mac.finalize().into_bytes())
+            }
+            "sha512" => {
+                let mut mac = <HmacSha512 as KeyInit>::new_from_slice(req.key.as_bytes())
+                    .map_err(|e| McpError::invalid_params(format!("HMAC key error: {}", e), None))?;
+                mac.update(req.message.as_bytes());
+                hex::encode(mac.finalize().into_bytes())
+            }
+            _ => return Err(McpError::invalid_params("Invalid algorithm. Use: sha256, sha512", None)),
+        };
+
+        let result = json!({
+            "message": req.message,
+            "algorithm": format!("HMAC-{}", req.algorithm.to_uppercase()),
+            "signature": signature,
+            "key_length": req.key.len()
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "HMAC Signature:\n{}",
+            serde_json::to_string_pretty(&result).unwrap()
+        ))]))
+    }
+
+    #[tool(description = "Verify HMAC signature")]
+    fn hmac_verify(&self, Parameters(req): Parameters<HmacVerifyRequest>) -> Result<CallToolResult, McpError> {
+        type HmacSha256 = Hmac<Sha256>;
+        type HmacSha512 = Hmac<Sha512>;
+
+        let expected_signature = hex::decode(&req.signature)
+            .map_err(|e| McpError::invalid_params(format!("Invalid signature hex: {}", e), None))?;
+
+        let is_valid = match req.algorithm.to_lowercase().as_str() {
+            "sha256" => {
+                let mut mac = <HmacSha256 as KeyInit>::new_from_slice(req.key.as_bytes())
+                    .map_err(|e| McpError::invalid_params(format!("HMAC key error: {}", e), None))?;
+                mac.update(req.message.as_bytes());
+                let computed = mac.finalize().into_bytes();
+                computed.ct_eq(&expected_signature).into()
+            }
+            "sha512" => {
+                let mut mac = <HmacSha512 as KeyInit>::new_from_slice(req.key.as_bytes())
+                    .map_err(|e| McpError::invalid_params(format!("HMAC key error: {}", e), None))?;
+                mac.update(req.message.as_bytes());
+                let computed = mac.finalize().into_bytes();
+                computed.ct_eq(&expected_signature).into()
+            }
+            _ => return Err(McpError::invalid_params("Invalid algorithm. Use: sha256, sha512", None)),
+        };
+
+        let result = json!({
+            "message": req.message,
+            "algorithm": format!("HMAC-{}", req.algorithm.to_uppercase()),
+            "signature": req.signature,
+            "is_valid": is_valid,
+            "verification_status": if is_valid { "VALID" } else { "INVALID" }
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "HMAC Verification:\n{}",
+            serde_json::to_string_pretty(&result).unwrap()
+        ))]))
+    }
+
+    #[tool(description = "Create and sign JWT token")]
+    fn jwt_create(&self, Parameters(req): Parameters<JwtCreateRequest>) -> Result<CallToolResult, McpError> {
+        let algorithm = match req.algorithm.as_str() {
+            "HS256" => Algorithm::HS256,
+            "HS512" => Algorithm::HS512,
+            _ => return Err(McpError::invalid_params("Invalid algorithm. Use: HS256, HS512", None)),
+        };
+
+        let mut claims = req.payload;
+        
+        // Add expiration if specified
+        if let Some(expires_in) = req.expires_in {
+            let exp = Utc::now().timestamp() + expires_in as i64;
+            claims["exp"] = json!(exp);
+        }
+        
+        // Add issued at time
+        claims["iat"] = json!(Utc::now().timestamp());
+
+        let header = Header::new(algorithm);
+        let encoding_key = EncodingKey::from_secret(req.secret.as_bytes());
+
+        match encode(&header, &claims, &encoding_key) {
+            Ok(token) => {
+                let result = json!({
+                    "token": token,
+                    "algorithm": req.algorithm,
+                    "payload": claims,
+                    "expires_in": req.expires_in
+                });
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "JWT Created:\n{}",
+                    serde_json::to_string_pretty(&result).unwrap()
+                ))]))
+            }
+            Err(e) => Err(McpError::invalid_params(format!("JWT creation failed: {}", e), None)),
+        }
+    }
+
+    #[tool(description = "Verify JWT token signature and decode payload")]
+    fn jwt_verify(&self, Parameters(req): Parameters<JwtVerifyRequest>) -> Result<CallToolResult, McpError> {
+        let algorithm = match req.algorithm.as_str() {
+            "HS256" => Algorithm::HS256,
+            "HS512" => Algorithm::HS512,
+            _ => return Err(McpError::invalid_params("Invalid algorithm. Use: HS256, HS512", None)),
+        };
+
+        let decoding_key = DecodingKey::from_secret(req.secret.as_bytes());
+        let mut validation = Validation::new(algorithm);
+        validation.validate_exp = true;
+
+        match decode::<serde_json::Value>(&req.token, &decoding_key, &validation) {
+            Ok(token_data) => {
+                let result = json!({
+                    "is_valid": true,
+                    "algorithm": req.algorithm,
+                    "header": token_data.header,
+                    "payload": token_data.claims,
+                    "verification_status": "VALID"
+                });
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "JWT Verification:\n{}",
+                    serde_json::to_string_pretty(&result).unwrap()
+                ))]))
+            }
+            Err(e) => {
+                let result = json!({
+                    "is_valid": false,
+                    "algorithm": req.algorithm,
+                    "error": format!("{}", e),
+                    "verification_status": "INVALID"
+                });
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "JWT Verification:\n{}",
+                    serde_json::to_string_pretty(&result).unwrap()
+                ))]))
+            }
+        }
+    }
+
+    #[tool(description = "Parse and analyze URLs")]
+    fn url_parse(&self, Parameters(req): Parameters<UrlRequest>) -> Result<CallToolResult, McpError> {
+        match Url::parse(&req.url) {
+            Ok(parsed_url) => {
+                let result = json!({
+                    "original": req.url,
+                    "scheme": parsed_url.scheme(),
+                    "host": parsed_url.host_str(),
+                    "port": parsed_url.port(),
+                    "path": parsed_url.path(),
+                    "query": parsed_url.query(),
+                    "fragment": parsed_url.fragment(),
+                    "domain": parsed_url.domain(),
+                    "is_secure": parsed_url.scheme() == "https",
+                    "full_url": parsed_url.as_str()
+                });
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "URL Analysis:\n{}",
+                    serde_json::to_string_pretty(&result).unwrap()
+                ))]))
+            }
+            Err(e) => Err(McpError::invalid_params(format!("Invalid URL: {}", e), None)),
+        }
+    }
+
+    #[tool(description = "URL encode text")]
+    fn url_encode(&self, Parameters(req): Parameters<UrlRequest>) -> Result<CallToolResult, McpError> {
+        let encoded = urlencoding::encode(&req.url);
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "URL Encoded: {}",
+            encoded
+        ))]))
+    }
+
+    #[tool(description = "URL decode text")]
+    fn url_decode(&self, Parameters(req): Parameters<UrlRequest>) -> Result<CallToolResult, McpError> {
+        match urlencoding::decode(&req.url) {
+            Ok(decoded) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "URL Decoded: {}",
+                decoded
+            ))])),
+            Err(e) => Err(McpError::invalid_params(format!("URL decode error: {}", e), None)),
+        }
+    }
+
+    #[tool(description = "Find regex matches in text")]
+    fn regex_find(&self, Parameters(req): Parameters<RegexRequest>) -> Result<CallToolResult, McpError> {
+        match Regex::new(&req.pattern) {
+            Ok(regex) => {
+                let matches: Vec<_> = regex.find_iter(&req.text).map(|m| {
+                    json!({
+                        "match": m.as_str(),
+                        "start": m.start(),
+                        "end": m.end()
+                    })
+                }).collect();
+
+                let result = json!({
+                    "pattern": req.pattern,
+                    "text": req.text,
+                    "matches": matches,
+                    "match_count": matches.len()
+                });
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Regex Find Results:\n{}",
+                    serde_json::to_string_pretty(&result).unwrap()
+                ))]))
+            }
+            Err(e) => Err(McpError::invalid_params(format!("Invalid regex pattern: {}", e), None)),
+        }
+    }
+
+    #[tool(description = "Replace text using regex")]
+    fn regex_replace(&self, Parameters(req): Parameters<RegexRequest>) -> Result<CallToolResult, McpError> {
+        let replacement = req.replacement.as_deref().unwrap_or("");
+        
+        match Regex::new(&req.pattern) {
+            Ok(regex) => {
+                let result_text = if req.global {
+                    regex.replace_all(&req.text, replacement).into_owned()
+                } else {
+                    regex.replace(&req.text, replacement).into_owned()
+                };
+
+                let result = json!({
+                    "pattern": req.pattern,
+                    "original": req.text,
+                    "replacement": replacement,
+                    "result": result_text,
+                    "global": req.global
+                });
+
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Regex Replace Result:\n{}",
+                    serde_json::to_string_pretty(&result).unwrap()
+                ))]))
+            }
+            Err(e) => Err(McpError::invalid_params(format!("Invalid regex pattern: {}", e), None)),
+        }
+    }
+
+    #[tool(description = "Text processing utilities")]
+    fn text_utils(&self, Parameters(req): Parameters<TextUtilsRequest>) -> Result<CallToolResult, McpError> {
+        let result = match req.operation.as_str() {
+            "word_count" => {
+                let word_count = req.text.split_whitespace().count();
+                json!({
+                    "operation": "word_count",
+                    "text": req.text,
+                    "result": word_count
+                })
+            }
+            "char_count" => {
+                let char_count = req.text.chars().count();
+                json!({
+                    "operation": "char_count",
+                    "text": req.text,
+                    "result": char_count
+                })
+            }
+            "line_count" => {
+                let line_count = req.text.lines().count();
+                json!({
+                    "operation": "line_count",
+                    "text": req.text,
+                    "result": line_count
+                })
+            }
+            "reverse" => {
+                let reversed = req.text.chars().rev().collect::<String>();
+                json!({
+                    "operation": "reverse",
+                    "original": req.text,
+                    "result": reversed
+                })
+            }
+            "slugify" => {
+                let slug = req.text
+                    .to_lowercase()
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() { c } else { '-' })
+                    .collect::<String>()
+                    .split('-')
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<&str>>()
+                    .join("-");
+                json!({
+                    "operation": "slugify",
+                    "original": req.text,
+                    "result": slug
+                })
+            }
+            "uppercase" => {
+                json!({
+                    "operation": "uppercase",
+                    "original": req.text,
+                    "result": req.text.to_uppercase()
+                })
+            }
+            "lowercase" => {
+                json!({
+                    "operation": "lowercase",
+                    "original": req.text,
+                    "result": req.text.to_lowercase()
+                })
+            }
+            "trim" => {
+                json!({
+                    "operation": "trim",
+                    "original": req.text,
+                    "result": req.text.trim()
+                })
+            }
+            _ => return Err(McpError::invalid_params("Invalid operation. Use: word_count, char_count, line_count, reverse, slugify, uppercase, lowercase, trim", None)),
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Text Processing Result:\n{}",
+            serde_json::to_string_pretty(&result).unwrap()
+        ))]))
+    }
 }
 
 #[tool_handler]
@@ -421,17 +944,27 @@ impl ServerHandler for UtilityToolsServer {
                 website_url: None,
             },
             instructions: Some(
-                "This server provides various utility tools including:\n\
+                "This server provides comprehensive utility tools including:\n\n\
+                🏓 BASIC TOOLS:\n\
                 - ping: Simple connectivity test\n\
-                - get_current_time: Get current time in various formats\n\
+                - get_current_time: Get current time in various formats\n\n\
+                🔐 CRYPTOGRAPHY & SECURITY:\n\
+                - hash_text: Hash text using MD5, SHA1, SHA256, SHA512\n\
+                - bcrypt_hash: Hash/verify passwords with bcrypt\n\
+                - generate_rsa_keypair: Generate RSA key pairs\n\
+                - aes_encrypt/aes_decrypt: AES-256-GCM symmetric encryption\n\
+                - hmac_sign/hmac_verify: HMAC message authentication\n\n\
+                🔧 ENCODING & UTILITIES:\n\
                 - base64_encode/base64_decode: Base64 encoding/decoding\n\
                 - generate_token: Generate random tokens\n\
-                - analyze_password: Analyze password strength\n\
-                - parse_jwt: Parse JWT tokens\n\
-                - hash_text: Hash text using MD5, SHA1, SHA256, SHA512\n\
-                - bcrypt_hash: Hash/verify with bcrypt\n\
                 - generate_uuid: Generate UUIDs\n\
-                - generate_rsa_keypair: Generate RSA key pairs".to_string()
+                - url_parse/url_encode/url_decode: URL utilities\n\n\
+                🔍 ANALYSIS & PROCESSING:\n\
+                - analyze_password: Comprehensive password strength analysis\n\
+                - parse_jwt: Parse JWT tokens (basic)\n\
+                - jwt_create/jwt_verify: Create and verify signed JWT tokens\n\
+                - regex_find/regex_replace: Regular expression operations\n\
+                - text_utils: Text processing (word count, case conversion, etc.)".to_string()
             ),
         }
     }
