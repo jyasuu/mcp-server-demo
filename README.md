@@ -199,3 +199,10 @@ This project uses the published `rmcp` package (v0.8.1) with the following featu
 - `auth`: Authentication support
 - `elicitation`: Dynamic parameter elicitation
 - `schemars`: JSON Schema generation
+
+
+## Test MCP Server 
+
+```bash
+npx @modelcontextprotocol/inspector
+```
