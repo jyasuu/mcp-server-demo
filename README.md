@@ -206,3 +206,10 @@ This project uses the published `rmcp` package (v0.8.1) with the following featu
 ```bash
 npx @modelcontextprotocol/inspector
 ```
+
+
+
+## Deploy
+
+- https://ap-southeast-1.run.claw.cloud/
+- https://alcbyqyyvqly.ap-southeast-1.clawcloudrun.com/mcp
