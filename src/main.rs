@@ -6,6 +6,8 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
     {self},
 };
+use axum::http::{Method, HeaderName};
+use tower_http::cors::{CorsLayer, Any};
 
 mod utility_tools;
 use utility_tools::UtilityToolsServer;
@@ -28,7 +30,20 @@ async fn main() -> anyhow::Result<()> {
         Default::default(),
     );
 
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(Any)
+        .expose_headers([
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("mcp-protocol-version"),
+            HeaderName::from_static("mcp-session-id"),
+            HeaderName::from_static("access-control-allow-origin"),
+        ]);
+
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(cors);
     let tcp_listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
     
     println!("MCP Utility Tools Server starting on http://{}", BIND_ADDRESS);
